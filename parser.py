@@ -1,26 +1,19 @@
 """
 Monarch JSON Extractor
 ======================
-Reads two source JSON files and extracts all required fields into a clean,
-structured output JSON.
+Reads monarch_1.json (S1 episode details) and monarch_2.json (full page layout)
+and extracts all fields into a clean, structured output JSON.
 
-monarch_1.json  --> Season 1 episode details: descriptions, release dates,
-                    durations (in seconds), thumbnails.
+Designed to work across multiple Apple TV show pages — no hardcoded show IDs,
+shelf indexes, or episode counts.
 
-monarch_2.json  --> Full page layout (shelves). Holds series-level info,
-                    season metadata, trailers, bonus content, cast & crew,
-                    and partial episode data for both seasons.
-
-How the shelves in monarch_2 are laid out:
-  shelves[0]  → Canonical header (series ID, canonical URL)
-  shelves[1]  → Episode grid (EpisodeLockup rows for both seasons)
-  shelves[2]  → Official trailers
-  shelves[3]  → Bonus clips
-  shelves[4]  → Related content  (not used)
-  shelves[5]  → Cast & Crew (24 PersonLockup items)
-  shelves[6]  → How to watch   (not used)
-  shelves[7]  → About / show info (title, genres, synopsis)
-  shelves[8]  → Technical info (rating, languages, subtitles)
+monarch_2 shelf types (matched by ID substring, not position):
+  uts.marker.EpisodeList   → Episode grid (EpisodeLockup rows, all seasons)
+  uts.col.Trailers.*       → Trailers
+  uts.col.BonusContent.*   → Bonus clips
+  uts.col.CastAndCrew.*    → Cast & Crew
+  uts.marker.About         → Show info (title, genres, synopsis)
+  uts.marker.Info          → Technical info (content advisory, audio, subtitles)
 """
 
 import json
@@ -28,16 +21,7 @@ import datetime
 
 
 def safe_get(data, *keys, fallback=None):
-    """
-    Safely walk a chain of dictionary keys without crashing.
-
-    Normally if you write  d["a"]["b"]["c"]  and "b" is missing, Python
-    raises a KeyError.  This function returns `fallback` (default: None)
-    instead of crashing.
-
-    Example:
-        safe_get(d, "a", "b", "c")   # same as d["a"]["b"]["c"] but safe
-    """
+    """Walk a chain of dict keys safely; return fallback if any key is missing."""
     current = data
     for key in keys:
         if not isinstance(current, dict):
@@ -48,792 +32,465 @@ def safe_get(data, *keys, fallback=None):
     return current
 
 
-def split_comma_string_to_list(text):
-    """
-    Convert a simple comma-separated string into a clean Python list.
-
-    Use this for fields where each entry does NOT contain commas itself,
-    such as content_advisory: "Language, Violence, Horror".
-
-    Steps:
-      1. Split on every comma.
-      2. Strip leading/trailing whitespace from each piece.
-      3. Discard any empty pieces (e.g. from a trailing comma).
-
-    Example:
-        "Language, Violence, " → ["Language", "Violence"]
-    """
-    if not text:
-        return []
-
-    result = []
-    # Split on commas to get individual pieces
-    pieces = text.split(",")
-    for piece in pieces:
-        clean_piece = piece.strip()  # remove surrounding spaces
-        if clean_piece:  # skip empty strings
-            result.append(clean_piece)
-    return result
-
-
-def split_language_string_to_list(text):
-    """
-    Convert an audio-language or subtitle string into a clean Python list.
-
-    This is different from split_comma_string_to_list because each language
-    entry CONTAINS commas inside its parentheses. For example:
-
-        "English (AD, Dolby Atmos, Dolby 5.1, AAC), French (Canada) (AD, ...)"
-
-    A plain comma split would shatter "Dolby Atmos, Dolby 5.1, AAC" into
-    separate pieces.
-
-    The correct delimiter here is "), " — every entry ends with a closing
-    parenthesis and is followed by a comma+space before the next entry.
-
-    Strategy:
-      1. Split on "), " (the boundary between entries).
-      2. Re-attach ")" to every piece except the last one (which already
-         ends with its own closing paren).
-      3. Strip whitespace and skip empty pieces.
-
-    Example:
-        "English (CC, SDH), Arabic (SDH), Bulgarian (SDH)"
-        → ["English (CC, SDH)", "Arabic (SDH)", "Bulgarian (SDH)"]
-    """
-    if not text:
-        return []
-
-    pieces = text.split("), ")
-
-    result = []
-    for i in range(len(pieces)):
-        piece = pieces[i].strip()
-        if not piece:
-            continue
-
-
-        if i < len(pieces) - 1:
-            piece = piece + ")"
-
-        result.append(piece)
-
-    return result
-
-
-def milliseconds_to_year(timestamp_ms):
-    """
-    Convert a Unix timestamp in milliseconds to a 4-digit year string.
-
-    Apple TV stores dates as milliseconds since the Unix epoch (Jan 1, 1970).
-    Python's datetime functions expect seconds, so we divide by 1000 first.
-
-    Returns "" if the timestamp is None or invalid.
-    """
-    if timestamp_ms is None:
+def ms_to_year(ms):
+    """Unix timestamp in milliseconds → 4-digit year string, or ''."""
+    if ms is None:
         return ""
     try:
-        timestamp_seconds = timestamp_ms / 1000
-        year = datetime.datetime.utcfromtimestamp(timestamp_seconds).year
-        return str(year)
+        return str(
+            datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).year
+        )
     except (OSError, OverflowError, ValueError):
         return ""
 
 
-def milliseconds_to_date_string(timestamp_ms):
-    """
-    Convert a Unix timestamp in milliseconds to a "YYYY-MM-DD" date string.
-    """
-    if timestamp_ms is None:
+def ms_to_date(ms):
+    """Unix timestamp in milliseconds → 'YYYY-MM-DD' string, or ''."""
+    if ms is None:
         return ""
     try:
-        timestamp_seconds = timestamp_ms / 1000
-        dt = datetime.datetime.utcfromtimestamp(timestamp_seconds)
-        return dt.strftime("%Y-%m-%d")
+        return datetime.datetime.fromtimestamp(
+            ms / 1000, datetime.timezone.utc
+        ).strftime("%Y-%m-%d")
     except (OSError, OverflowError, ValueError):
         return ""
 
 
-def seconds_to_duration_string(seconds):
-    """
-    Convert an integer number of seconds into a human-readable duration string.
-    """
+def secs_to_duration(seconds):
+    """Integer seconds → '49 min' or '1h 2m' string, or ''."""
     if seconds is None:
         return ""
-    minutes = seconds // 60
-    hours = minutes // 60
-    remaining_mins = minutes % 60
-    if hours > 0:
-        return f"{hours}h {remaining_mins}m"
-    return f"{minutes} min"
+    mins = seconds // 60
+    hours = mins // 60
+    return f"{hours}h {mins % 60}m" if hours else f"{mins} min"
 
 
-def load_json_file(file_path):
-    with open(file_path, "r", encoding="utf-8") as file:
-        data = json.load(file)
-    return data
+def split_comma(text):
+    """Split a simple comma-separated string into a trimmed list (no empties)."""
+    return [p.strip() for p in text.split(",") if p.strip()] if text else []
 
 
-def write_json_file(data, output_path):
-    with open(output_path, "w", encoding="utf-8") as out_file:
-        json.dump(data, out_file, indent=2, ensure_ascii=False)
-
-
-def get_shelves(monarch_2):
+def split_language(text):
     """
-    Return the list of shelf objects from monarch_2.
-
-    The full path is: monarch_2["data"][1]["data"]["shelves"]
-    We extract this once here so every other function can call get_shelves()
-    instead of repeating the long chain.
+    Split audio/subtitle strings where entries are delimited by '), '.
+    Each entry contains commas internally (e.g. 'English (AD, Dolby Atmos, AAC)'),
+    so a plain comma-split would break them apart.
     """
-    return monarch_2["data"][1]["data"]["shelves"]
+    if not text:
+        return []
+    pieces = text.split("), ")
+    # Re-attach the ')' that split() consumed — all pieces except the last lost it
+    return [
+        (p.strip() + ")" if i < len(pieces) - 1 else p.strip())
+        for i, p in enumerate(pieces)
+        if p.strip()
+    ]
 
 
-def get_page_object(monarch_2):
+def get_page(monarch_2):
     """
-    Return the top-level page object from monarch_2.
+    Return the show page data object from monarch_2.
 
-    This is used to access canonicalURL, channel, and other page-level fields.
+    monarch_2["data"] is a list of intent objects. We find the one whose
+    intent.$kind is "ShowPageIntent" rather than assuming a fixed index,
+    so this works regardless of how many intent objects precede it.
     """
-    return monarch_2["data"][1]["data"]
+    for item in monarch_2.get("data", []):
+        if item.get("intent", {}).get("$kind") == "ShowPageIntent":
+            return item["data"]
+    raise ValueError(
+        "ShowPageIntent not found in monarch_2 data — unexpected file structure."
+    )
 
 
-def extract_series_id(shelves):
+def find_shelf(shelves, id_substring):
     """
-    Extract the series' unique internal ID.
+    Return the first shelf whose 'id' contains id_substring, or None.
 
-    Location: shelves[1] → header → id
-    The value looks like "ShelfHeader#20070".
+    Shelf IDs have two formats:
+      - Fixed markers:  'uts.marker.EpisodeList', 'uts.marker.About', 'uts.marker.Info'
+      - Show-specific:  'uts.col.Trailers.umc.cmc.XXXX', 'uts.col.CastAndCrew.umc.cmc.XXXX'
 
-    shelves[1] is the episode grid shelf. Its header contains the ID that
-    Apple TV uses to identify this show's episode list.
+    Matching by substring handles both: 'uts.col.Trailers.' matches any show's
+    trailer shelf regardless of the show ID appended to it.
     """
-    shelf_episodes = shelves[1]
-    series_id = safe_get(shelf_episodes, "header", "id", fallback="")
-    return series_id
+    for shelf in shelves:
+        if id_substring in shelf.get("id", ""):
+            return shelf
+    return None
 
 
-def extract_series_url(monarch_2):
-    """
-    Extract the canonical (clean, permanent) URL for the show's page.
+def extract_series_fields(monarch_1, monarch_2):
+    """Return a dict of all top-level series fields."""
+    page = get_page(monarch_2)
+    shelves = page["shelves"]
 
-    Location: monarch_2["data"][1]["data"] → canonicalURL
-    """
-    page = get_page_object(monarch_2)
-    return page.get("canonicalURL", "")
+    shelf_episodes = find_shelf(shelves, "uts.marker.EpisodeList")
+    shelf_about = find_shelf(shelves, "uts.marker.About")
+    shelf_info = find_shelf(shelves, "uts.marker.Info")
 
+    # Show info — About shelf, single item
+    about = shelf_about["items"][0]
 
-def extract_show_info(shelves):
-    """
-    Extract the show's title, synopsis, and genres from shelves[7].
+    # Technical info — Info shelf
+    s0 = shelf_info["items"][0].get("items", [])  # content advisory row
+    s1 = shelf_info["items"][1].get("items", [])  # audio / subtitle row
 
-    shelves[7] is the "About" shelf. It has exactly one item that contains
-    the show's display title, long description, and genre tags.
+    audio_raw = s1[1].get("info", "") if len(s1) > 1 else ""
+    # Strip invisible Unicode bidi-isolate chars Apple TV injects around "Dolby 5.1"
+    audio_clean = audio_raw.replace("\u2068", "").replace("\u2069", "")
 
-    Returns a dict with keys: title, synopsis, genres
-    """
-    shelf_about = shelves[7]
-    # There is exactly one item in this shelf
-    about_item = shelf_about["items"][0]
+    # Release year: find the earliest episode release date across all episodes in
+    # monarch_1. This avoids depending on any specific hardcoded playable key,
+    # which changes per show.
+    ep_dates = [
+        ep.get("releaseDate")
+        for ep in monarch_1["data"]["episodes"]
+        if ep.get("releaseDate")
+    ]
+    release_year = ms_to_year(min(ep_dates)) if ep_dates else ""
 
-    title = about_item.get("title", "")
-    synopsis = about_item.get("description", "")
-    genres = about_item.get("genres", [])  # already a plain list in the source
-
-    return {
-        "title": title,
-        "synopsis": synopsis,
-        "genres": genres,
-    }
-
-
-def extract_seasons_metadata(shelves):
-    """
-    Extract the list of seasons and total season count from shelves[1].
-
-    The header of the episode shelf contains a "seasons" array. Each entry has:
-      - seasonNumber  (1, 2, ...)
-      - title         ("Season 1", "Season 2", ...)
-      - episodeCount  (total number of episodes in that season)
-
-    Returns a tuple: (seasons_list, total_seasons_count)
-      - seasons_list is the raw list from the JSON (used later to build output)
-      - total_seasons_count is just len(seasons_list)
-    """
-    shelf_episodes = shelves[1]
     seasons_list = safe_get(shelf_episodes, "header", "seasons", fallback=[])
-    total_seasons_count = len(seasons_list)
-    return seasons_list, total_seasons_count
-
-
-def extract_technical_info(shelves):
-    """
-    Extract content advisory, audio languages, and subtitle strings from shelves[8].
-
-    shelves[8] is the "Info" shelf. Its structure:
-      items[0] → sub-items:
-        [0] release year string
-        [1] content rating display name (e.g. "U/A 16+")
-        [2] content advisory string    ← we want this
-        [3] countries of origin
-      items[1] → sub-items:
-        [0] primary audio language short form
-        [1] full audio languages string  ← we want this
-        [2] full subtitles string        ← we want this
-
-    Returns a dict with keys: content_advisory, audio_languages, subtitles
-    All three are returned as comma-separated strings; the caller can split them.
-    """
-    shelf_tech = shelves[8]
-    tech_items = shelf_tech.get("items", [])
-
-    # Safely get the first and second top-level item from shelf 8
-    item_0 = tech_items[0] if len(tech_items) > 0 else {}
-    item_1 = tech_items[1] if len(tech_items) > 1 else {}
-
-    sub_items_0 = item_0.get("items", [])
-    sub_items_1 = item_1.get("items", [])
-
-    # Content advisory is at sub_items_0[2]
-    content_advisory_str = (
-        sub_items_0[2].get("info", "") if len(sub_items_0) > 2 else ""
-    )
-
-    # Audio languages is at sub_items_1[1]
-    audio_languages_raw = sub_items_1[1].get("info", "") if len(sub_items_1) > 1 else ""
-    audio_languages_str = audio_languages_raw.replace("\u2068", "").replace("\u2069", "")
-
-
-    # Subtitles is at sub_items_1[2]
-    subtitles_str = sub_items_1[2].get("info", "") if len(sub_items_1) > 2 else ""
 
     return {
-        "content_advisory": content_advisory_str,
-        "audio_languages": audio_languages_str,
-        "subtitles": subtitles_str,
+        "series_id": safe_get(shelf_episodes, "header", "id", fallback=""),
+        "series_url": page.get("canonicalURL", ""),
+        "title": about.get("title", ""),
+        "is_new_series": False,
+        "ranking": "",
+        "synopsis": about.get("description", ""),
+        "genres": about.get("genres", []),
+        "imdb_rating": "",
+        "release_year": release_year,
+        "total_seasons_count": len(seasons_list),
+        "content_advisory": split_comma(s0[2].get("info", "") if len(s0) > 2 else ""),
+        "audio_languages": split_language(audio_clean),
+        "subtitles": split_language(s1[2].get("info", "") if len(s1) > 2 else ""),
+        "studio": safe_get(page, "channel", "title", fallback=""),
+        "_seasons_list": seasons_list,
     }
 
 
-def extract_release_year(monarch_1):
-    """
-    Extract the show's release year from monarch_1's playables dictionary.
-
-    The specific playable we use is keyed by "tvs.sbd.4000:A0019601003:978645c3".
-    Its "canonicalMetadata.releaseDate" is a Unix timestamp in milliseconds.
-    We convert it to a 4-digit year string.
-
-    Returns "" if the key or timestamp is missing.
-    """
-    playables = monarch_1["data"]["playables"]
-
-    # This specific playable holds the show's canonical release date
-    playable_key = "tvs.sbd.4000:A0019601003:978645c3"
-    playable_entry = playables.get(playable_key, {})
-
-    timestamp_ms = safe_get(
-        playable_entry, "canonicalMetadata", "releaseDate", fallback=None
-    )
-    return milliseconds_to_year(timestamp_ms)
-
-
-def extract_studio(monarch_2):
-    """
-    Extract the studio / channel name from monarch_2's page object.
-
-    Location: monarch_2["data"][1]["data"] → channel → title
-    Expected value: "Apple TV"
-    """
-    page = get_page_object(monarch_2)
-    return safe_get(page, "channel", "title", fallback="")
+# Subtitle values that identify crew roles rather than actor character names.
+# Items whose subtitle matches one of these are routed to the producers list;
+# all others are treated as cast (subtitle = character name).
+PRODUCER_SUBTITLES = {"Executive Producer", "Producer", "Co-Executive Producer"}
 
 
 def extract_cast_and_crew(shelves):
     """
-    Extract all cast and crew member names from shelves[5].
+    Split the CastAndCrew shelf into two deduplicated lists:
+      - cast:      people whose subtitle is a character name (actors)
+      - producers: people whose subtitle is a crew role (e.g. "Executive Producer")
 
-    shelves[5] is the Cast & Crew shelf. It contains 24 PersonLockup items.
-    Each item has a "title" key with the person's name.
+    Each entry is a dict with "name" and "designation" so downstream consumers
+    know both the person and their role/character without needing to infer it.
 
-    We loop through all items and build a list of names.
-    Duplicates are filtered out using a seen_names set (preserves order).
-
-    Returns a list of name strings, e.g.:
-      ["Kurt Russell", "Wyatt Russell", "Anna Sawai", ...]
+    Returns a tuple: (cast_list, producers_list)
     """
-    shelf_cast = shelves[5]
-    cast_items = shelf_cast.get("items", [])
+    shelf = find_shelf(shelves, "uts.col.CastAndCrew.")
+    if not shelf:
+        return [], []
 
-    names = []
-    seen_names = set()  # tracks names already added to avoid duplicates
+    cast = []
+    producers = []
+    seen = set()
 
-    for item in cast_items:
+    for item in shelf.get("items", []):
         name = item.get("title", "").strip()
-        # Only add this name if it's non-empty and not already in the list
-        if name and name not in seen_names:
-            seen_names.add(name)
-            names.append(name)
+        subtitle = item.get("subtitle", "").strip()
 
-    return names
-
-
-def build_trailer_entry(title, video_stream_url, thumbnail_url, duration_secs):
-    """
-    Build a single trailer/bonus dictionary in the output format.
-
-    This is a small helper to avoid repeating the same dict structure
-    in both the trailers loop and the bonus loop.
-
-    duration_secs can be an integer (seconds) or None.
-    """
-    if duration_secs is not None:
-        duration_str = str(duration_secs) + "s"
-    else:
-        duration_str = ""
-
-    return {
-        "title": title,
-        "video_stream_url": video_stream_url,
-        "thumbnail_url": thumbnail_url,
-        "content_rating": "",  # not available in source data
-        "duration": duration_str,
-    }
-
-
-def extract_trailers(shelves, seen_video_urls):
-    """
-    Extract official trailers from shelves[2].
-
-    Each trailer item has two parallel locations:
-      - shelf_trailers["items"][i]
-          contextAction.title → trailer title
-          contextAction.url   → video stream URL
-      - shelf_trailers["playlistItems"][i]  (same index i)
-          playlist.lockup.artwork.template  → thumbnail URL
-          playlist.tabData.duration         → duration in seconds (integer)
-
-    seen_video_urls is a set passed in from the caller. We add URLs to it
-    as we process them so the bonus function can skip duplicates.
-
-    Returns a list of trailer dicts.
-    """
-    shelf_trailers = shelves[2]
-    trailer_items = shelf_trailers.get("items", [])
-    playlist_items = shelf_trailers.get("playlistItems", [])
-
-    trailers = []
-
-    for i in range(len(trailer_items)):
-        trailer_item = trailer_items[i]
-
-        # Title and URL come from the contextAction sub-object
-        context_action = trailer_item.get("contextAction", {})
-        trailer_title = context_action.get("title", "")
-        video_stream_url = context_action.get("url", "")
-
-        # Skip if we have already added this URL
-        if video_stream_url in seen_video_urls:
+        if not name or name in seen:
             continue
-        seen_video_urls.add(video_stream_url)
+        seen.add(name)
 
-        # Thumbnail and duration come from the matching playlistItems entry
-        if i < len(playlist_items):
-            playlist_entry = playlist_items[i].get("playlist", {})
-            thumbnail_url = safe_get(
-                playlist_entry, "lockup", "artwork", "template", fallback=""
-            )
-            duration_secs = safe_get(
-                playlist_entry, "tabData", "duration", fallback=None
-            )
+        entry = {"name": name, "designation": subtitle}
+
+        if subtitle in PRODUCER_SUBTITLES:
+            producers.append(entry)
         else:
-            thumbnail_url = ""
-            duration_secs = None
+            cast.append(entry)
 
-        entry = build_trailer_entry(
-            trailer_title, video_stream_url, thumbnail_url, duration_secs
-        )
-        trailers.append(entry)
-
-    return trailers
-
-
-def extract_bonus_content(shelves, seen_video_urls):
-    """
-    Extract bonus clips from shelves[3].
-
-    Bonus items have a slightly different structure from trailers:
-      - contextAction.title / contextAction.url  → title and stream URL  (same as trailers)
-      - artwork.template                          → thumbnail URL  (directly on the item)
-      - playAction.contentDescriptor.items[0]
-          .playable.canonicalMetadata.duration    → duration in seconds
-
-    seen_video_urls is the same set passed from the caller (shared with trailers)
-    so that videos appearing in both shelves are not duplicated.
-
-    Returns a list of bonus clip dicts.
-    """
-    shelf_bonus = shelves[3]
-    bonus_items = shelf_bonus.get("items", [])
-
-    bonus_clips = []
-
-    for bonus_item in bonus_items:
-        context_action = bonus_item.get("contextAction", {})
-        bonus_title = context_action.get("title", "")
-        video_stream_url = context_action.get("url", "")
-
-        # Skip duplicates
-        if video_stream_url in seen_video_urls:
-            continue
-        seen_video_urls.add(video_stream_url)
-
-        # Thumbnail is directly under artwork (not inside playlist like trailers)
-        thumbnail_url = safe_get(bonus_item, "artwork", "template", fallback="")
-
-        # Duration is buried inside the playAction → contentDescriptor chain
-        play_action = bonus_item.get("playAction", {})
-        cd_items = safe_get(play_action, "contentDescriptor", "items", fallback=[])
-        duration_secs = None
-        if cd_items:
-            duration_secs = safe_get(
-                cd_items[0], "playable", "canonicalMetadata", "duration", fallback=None
-            )
-
-        entry = build_trailer_entry(
-            bonus_title, video_stream_url, thumbnail_url, duration_secs
-        )
-        bonus_clips.append(entry)
-
-    return bonus_clips
+    return cast, producers
 
 
 def extract_trailers_and_bonus(shelves):
     """
-    Combine trailers (shelf 2) and bonus clips (shelf 3) into a single list.
+    Return a combined list of trailers and bonus clips.
 
-    We use a shared seen_video_urls set across both calls so a video that
-    appears in both shelves is only included once in the final output.
+    Trailers shelf (uts.col.Trailers.*):
+      title/URL from item.contextAction
+      thumbnail/duration from parallel playlistItems[i].playlist
 
-    Returns a combined list: trailers first, then bonus clips.
+    Bonus shelf (uts.col.BonusContent.*):
+      title/URL from item.contextAction
+      thumbnail from item.artwork.template
+      duration from item.playAction.contentDescriptor.items[0].playable.canonicalMetadata.duration
     """
-    seen_video_urls = set()  # shared across both shelf extractions
+    seen_urls = set()
+    results = []
 
-    trailers = extract_trailers(shelves, seen_video_urls)
-    bonus_clips = extract_bonus_content(shelves, seen_video_urls)
+    # ── Trailers ──
+    shelf_trailers = find_shelf(shelves, "uts.col.Trailers.")
+    if shelf_trailers:
+        trailer_items = shelf_trailers.get("items", [])
+        playlist_items = shelf_trailers.get("playlistItems", [])
 
-    return trailers + bonus_clips
+        for i, item in enumerate(trailer_items):
+            ca = item.get("contextAction", {})
+            url = ca.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            playlist = (
+                playlist_items[i].get("playlist", {}) if i < len(playlist_items) else {}
+            )
+            duration_secs = safe_get(playlist, "tabData", "duration")
+
+            results.append(
+                {
+                    "title": ca.get("title", ""),
+                    "video_stream_url": url,
+                    "thumbnail_url": safe_get(
+                        playlist, "lockup", "artwork", "template", fallback=""
+                    ),
+                    "content_rating": "",
+                    "duration": (
+                        f"{duration_secs}s" if duration_secs is not None else ""
+                    ),
+                }
+            )
+
+    # ── Bonus clips ──
+    shelf_bonus = find_shelf(shelves, "uts.col.BonusContent.")
+    if shelf_bonus:
+        for item in shelf_bonus.get("items", []):
+            ca = item.get("contextAction", {})
+            url = ca.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            cd_items = safe_get(
+                item, "playAction", "contentDescriptor", "items", fallback=[]
+            )
+            duration_secs = (
+                safe_get(cd_items[0], "playable", "canonicalMetadata", "duration")
+                if cd_items
+                else None
+            )
+
+            results.append(
+                {
+                    "title": ca.get("title", ""),
+                    "video_stream_url": url,
+                    "thumbnail_url": safe_get(item, "artwork", "template", fallback=""),
+                    "content_rating": "",
+                    "duration": (
+                        f"{duration_secs}s" if duration_secs is not None else ""
+                    ),
+                }
+            )
+
+    return results
 
 
 def build_m2_episode_lookup(shelves):
     """
-    Build a dictionary that lets us quickly find any episode's data from monarch_2.
-
-    We loop through shelves[1] (the episode grid) and collect every item
-    whose "$kind" is "EpisodeLockup". We key each one by its episodeIndex
-    (a 0-based integer: 0–9 = Season 1, 10–19 = Season 2).
-
-    Returns a dict like: { 5: {...ep6 data...}, 6: {...ep7 data...}, ... }
-
-    monarch_2 only has episodeIndexes 5–15 (S1 ep6–10 and all of S2).
-    Episodes 0–4 (S1 ep1–5) exist only in monarch_1.
+    Return {episodeIndex: item} for all EpisodeLockup rows in the EpisodeList shelf.
+    episodeIndex is a 0-based global counter across all seasons.
     """
-    shelf_episodes = shelves[1]
-    episode_items = shelf_episodes.get("items", [])
-
-    m2_ep_lookup = {}
-
-    for item in episode_items:
-        # The episode grid also contains pagination rows — skip those
-        if item.get("$kind") != "EpisodeLockup":
-            continue
-
-        ep_index = item.get("episodeIndex")
-        if ep_index is not None:
-            m2_ep_lookup[ep_index] = item
-
-    return m2_ep_lookup
-
-
-def build_episode_entry(
-    episode_number,
-    title,
-    url,
-    thumbnail_url,
-    synopsis,
-    content_rating,
-    duration,
-    release_date,
-):
-    """
-    Build a single episode dictionary in the output format.
-
-    This helper exists so both Season 1 and Season 2 loops produce
-    episode dicts with exactly the same keys in the same order.
-    """
+    shelf = find_shelf(shelves, "uts.marker.EpisodeList")
+    if not shelf:
+        return {}
     return {
-        "episode_number": episode_number,
-        "episode_title": title,
-        "episode_url": url,
-        "thumbnail_url": thumbnail_url,
-        "synopsis": synopsis,
-        "content_rating": content_rating,
-        "duration": duration,
-        "release_date": release_date,
+        item["episodeIndex"]: item
+        for item in shelf.get("items", [])
+        if item.get("$kind") == "EpisodeLockup" and "episodeIndex" in item
     }
 
 
-def extract_season1_episodes(monarch_1, m2_ep_lookup):
+def extract_season_episodes(season_number, season_start_index, monarch_1, m2_ep_lookup):
     """
-    Build the list of Season 1 episode dicts.
+    Build the episode list for a single season.
 
-    monarch_1 is the primary source for Season 1 (10 episodes, index 0–9).
-    It provides: title, URL, synopsis, releaseDate (ms), duration (seconds),
-    thumbnail, and content_rating.
+    season_number:      1-based (1, 2, 3 ...)
+    season_start_index: the episodeIndex in monarch_2 where this season begins.
+                        Derived from the sum of all previous seasons' episodeCounts,
+                        so it works for any show with any number of seasons.
 
-    monarch_2 provides supplementary data for S1 ep6–10 (episodeIndex 5–9):
-    thumbnail template, URL, and a pre-formatted duration string.
-    We use monarch_2 data only when monarch_1's value is empty.
+    Season 1 uses monarch_1 as primary source (rich data: release dates, exact
+    durations, thumbnails). monarch_2 fills gaps where monarch_1 is missing fields.
 
-    Returns a list of 10 episode dicts, sorted by episode_number.
+    Season 2+ uses monarch_2 only (monarch_1 never contains later seasons).
     """
-    m1_episodes = monarch_1["data"]["episodes"]
+    episodes = []
+    seen = set()
 
-    season1_episodes = []
-    seen_episode_numbers = set()  # prevents accidentally adding duplicates
+    if season_number == 1:
+        for ep in monarch_1["data"]["episodes"]:
+            num = ep.get("episodeNumber")
+            if num in seen:
+                continue
+            seen.add(num)
 
-    for m1_ep in m1_episodes:
-        ep_number = m1_ep.get("episodeNumber")  # 1-based: 1, 2, 3 …
-        ep_index = m1_ep.get("episodeIndex")  # 0-based: 0, 1, 2 …
+            rating_obj = ep.get("rating", {})
+            thumbnail = safe_get(ep, "images", "contentImage", "url", fallback="")
+            url = ep.get("url", "")
+            duration = secs_to_duration(ep.get("duration"))
 
-        # Guard: skip if we somehow already added this episode number
-        if ep_number in seen_episode_numbers:
-            continue
-        seen_episode_numbers.add(ep_number)
+            # Supplement from monarch_2 for episodes it covers
+            m2 = m2_ep_lookup.get(ep.get("episodeIndex"))
+            if m2:
+                thumbnail = thumbnail or safe_get(
+                    m2, "artwork", "template", fallback=""
+                )
+                url = url or safe_get(m2, "segue", "url", fallback="")
+                duration = duration or m2.get("metadata", "")
 
-        # ── Primary fields from monarch_1 ──
-        ep_title = m1_ep.get("title", "")
-        ep_url = m1_ep.get("url", "")
-        ep_synopsis = m1_ep.get("description", "")
+            episodes.append(
+                {
+                    "episode_number": num,
+                    "episode_title": ep.get("title", ""),
+                    "episode_url": url,
+                    "thumbnail_url": thumbnail,
+                    "synopsis": ep.get("description", ""),
+                    "content_rating": (
+                        rating_obj.get("displayName", "")
+                        if isinstance(rating_obj, dict)
+                        else ""
+                    ),
+                    "duration": duration,
+                    "release_date": ms_to_date(ep.get("releaseDate")),
+                }
+            )
 
-        # Content rating: monarch_1 stores this as a dict; we want displayName
-        rating_obj = m1_ep.get("rating", {})
-        ep_content_rating = (
-            rating_obj.get("displayName", "") if isinstance(rating_obj, dict) else ""
-        )
+    else:
+        # ── Season 2+: monarch_2 only ──
+        # All episodes for this season sit between season_start_index and
+        # the next season's start. We just check idx >= season_start_index
+        # and convert to a 1-based episode number within the season.
+        for idx, ep in m2_ep_lookup.items():
+            if idx < season_start_index:
+                continue
+            # Stop if we've crossed into the next season's index range.
+            # We calculate this by checking the global ep index against the
+            # next boundary — but since we only call this per-season and
+            # assemble_output slices by start index, we filter in assemble_output.
+            num = idx - season_start_index + 1
+            if num in seen:
+                continue
+            seen.add(num)
 
-        # Release date: stored as milliseconds, convert to "YYYY-MM-DD"
-        ep_release_date = milliseconds_to_date_string(m1_ep.get("releaseDate"))
+            episodes.append(
+                {
+                    "episode_number": num,
+                    "episode_title": ep.get("title", ""),
+                    "episode_url": safe_get(ep, "segue", "url", fallback=""),
+                    "thumbnail_url": safe_get(ep, "artwork", "template", fallback=""),
+                    "synopsis": ep.get("description", ""),
+                    "content_rating": "",
+                    "duration": ep.get("metadata", ""),
+                    "release_date": "",
+                }
+            )
 
-        # Duration: stored as seconds (integer), convert to "X min" string
-        ep_duration = seconds_to_duration_string(m1_ep.get("duration"))
-
-        # Thumbnail: path is images → contentImage → url
-        ep_thumbnail = safe_get(m1_ep, "images", "contentImage", "url", fallback="")
-
-        # ── Supplement with monarch_2 if this episode is available there ──
-        # monarch_2 has S1 episodes for indexes 5–9 (ep6–10)
-        m2_ep = m2_ep_lookup.get(ep_index)
-
-        if m2_ep is not None:
-            # Fill in thumbnail if monarch_1 didn't provide one
-            if not ep_thumbnail:
-                ep_thumbnail = safe_get(m2_ep, "artwork", "template", fallback="")
-
-            # Fill in URL if monarch_1 didn't provide one
-            if not ep_url:
-                ep_url = safe_get(m2_ep, "segue", "url", fallback="")
-
-            # Fill in duration if monarch_1 didn't provide one
-            if not ep_duration:
-                ep_duration = m2_ep.get("metadata", "")
-
-        episode_entry = build_episode_entry(
-            episode_number=ep_number,
-            title=ep_title,
-            url=ep_url,
-            thumbnail_url=ep_thumbnail,
-            synopsis=ep_synopsis,
-            content_rating=ep_content_rating,
-            duration=ep_duration,
-            release_date=ep_release_date,
-        )
-        season1_episodes.append(episode_entry)
-
-    # Sort by episode number so they appear in the correct order
-    season1_episodes.sort(key=lambda ep: ep["episode_number"])
-    return season1_episodes
-
-
-def extract_season2_episodes(m2_ep_lookup):
-    """
-    Build the list of Season 2 episode dicts.
-
-    monarch_1 has no Season 2 data. monarch_2 is the only source.
-
-    Season 2 episodes have episodeIndex values starting at 10:
-      episodeIndex 10 → Season 2, Episode 1
-      episodeIndex 11 → Season 2, Episode 2
-      ... and so on.
-
-    We convert from the global 0-based index to a 1-based season-specific
-    episode number: ep_number = ep_index - 10 + 1
-
-    Returns a list of episode dicts, sorted by episode_number.
-    """
-    SEASON_2_START_INDEX = 10  # episodeIndex where Season 2 begins
-
-    season2_episodes = []
-    seen_episode_numbers = set()
-
-    for ep_index, m2_ep in m2_ep_lookup.items():
-        # Only process Season 2 entries
-        if ep_index < SEASON_2_START_INDEX:
-            continue
-
-        # Convert global index to season-specific episode number
-        ep_number = ep_index - SEASON_2_START_INDEX + 1
-
-        if ep_number in seen_episode_numbers:
-            continue
-        seen_episode_numbers.add(ep_number)
-
-        # All fields for Season 2 come from monarch_2
-        ep_title = m2_ep.get("title", "")
-        ep_url = safe_get(m2_ep, "segue", "url", fallback="")
-        ep_thumbnail = safe_get(m2_ep, "artwork", "template", fallback="")
-        ep_synopsis = m2_ep.get("description", "")
-        ep_duration = m2_ep.get("metadata", "")  # already a string like "45 min"
-
-        episode_entry = build_episode_entry(
-            episode_number=ep_number,
-            title=ep_title,
-            url=ep_url,
-            thumbnail_url=ep_thumbnail,
-            synopsis=ep_synopsis,
-            content_rating="",  # not available in monarch_2 for Season 2
-            duration=ep_duration,
-            release_date="",  # not available in monarch_2 for Season 2
-        )
-        season2_episodes.append(episode_entry)
-
-    season2_episodes.sort(key=lambda ep: ep["episode_number"])
-    return season2_episodes
-
-
-def build_seasons_output(seasons_list, season1_episodes, season2_episodes):
-    """
-    Build the final "seasons" list for the output JSON.
-
-    seasons_list is the raw list from monarch_2's episode shelf header.
-    Each entry has: seasonNumber, title ("Season 1"), episodeCount.
-
-    We match each entry to the correct episodes list and wrap them together.
-
-    Returns a list of season dicts, one per season.
-    """
-    seasons_output = []
-
-    for season_info in seasons_list:
-        season_number = season_info.get("seasonNumber")
-        season_label = season_info.get("title", f"Season {season_number}")
-        episode_count = season_info.get("episodeCount", 0)
-
-        # Pick the matching episodes list
-        if season_number == 1:
-            episodes_for_season = season1_episodes
-        elif season_number == 2:
-            episodes_for_season = season2_episodes
-        else:
-            episodes_for_season = []
-
-        seasons_output.append(
-            {
-                "season_label": season_label,
-                "total_episodes_count": episode_count,
-                "episodes": episodes_for_season,
-            }
-        )
-
-    return seasons_output
+    episodes.sort(key=lambda e: e["episode_number"])
+    return episodes
 
 
 def assemble_output(monarch_1, monarch_2):
-    """
-    Orchestrate all extraction steps and return the final output dictionary.
-
-    This is the main function that calls all the helpers above in order:
-      1. Get shelf shortcuts
-      2. Extract each group of fields
-      3. Convert comma-separated strings to lists
-      4. Assemble into the final dict
-
-    Returns the complete output dict ready to be written to JSON.
-    """
-    shelves = get_shelves(monarch_2)
-
+    page = get_page(monarch_2)
+    shelves = page["shelves"]
     m2_ep_lookup = build_m2_episode_lookup(shelves)
 
-    series_id = extract_series_id(shelves)
-    series_url = extract_series_url(monarch_2)
-    show_info = extract_show_info(shelves)
-    seasons_list, total_seasons_count = extract_seasons_metadata(shelves)
-    release_year = extract_release_year(monarch_1)
-    studio = extract_studio(monarch_2)
+    series = extract_series_fields(monarch_1, monarch_2)
+    seasons_list = series.pop("_seasons_list")  # internal key, not in output
 
-    tech_info = extract_technical_info(shelves)
+    # Build a per-season episode list.
+    # season_start_index is the cumulative sum of all previous seasons' episode counts.
+    # Example for a 3-season show with 10/8/6 eps:
+    #   S1 start = 0,  S2 start = 10,  S3 start = 18
+    # This works for any show without hardcoding episode counts.
+    seasons = []
+    cumulative_index = 0
 
-    content_advisory_list = split_comma_string_to_list(tech_info["content_advisory"])
-    audio_languages_list = split_language_string_to_list(tech_info["audio_languages"])
-    subtitles_list = split_language_string_to_list(tech_info["subtitles"])
+    for s in seasons_list:
+        season_number = s.get("seasonNumber")
+        ep_count = s.get("episodeCount", 0)
 
-    cast_and_crew_list = extract_cast_and_crew(shelves)
+        # For season 2+, only pass the slice of m2_ep_lookup relevant to this season
+        # (from cumulative_index up to cumulative_index + ep_count)
+        if season_number == 1:
+            season_lookup = m2_ep_lookup
+        else:
+            next_index = cumulative_index + ep_count
+            season_lookup = {
+                idx: ep
+                for idx, ep in m2_ep_lookup.items()
+                if cumulative_index <= idx < next_index
+            }
 
-    trailers_and_bonus = extract_trailers_and_bonus(shelves)
+        episodes = extract_season_episodes(
+            season_number=season_number,
+            season_start_index=cumulative_index,
+            monarch_1=monarch_1,
+            m2_ep_lookup=season_lookup,
+        )
 
-    season1_episodes = extract_season1_episodes(monarch_1, m2_ep_lookup)
-    season2_episodes = extract_season2_episodes(m2_ep_lookup)
+        seasons.append(
+            {
+                "season_label": s.get("title", f"Season {season_number}"),
+                "total_episodes_count": ep_count,
+                "episodes": episodes,
+            }
+        )
 
-    seasons_output = build_seasons_output(
-        seasons_list, season1_episodes, season2_episodes
-    )
+        cumulative_index += ep_count
 
-    output = {
-        # Series level
-        "series_id": series_id,
-        "series_url": series_url,
-        "title": show_info["title"],
-        "is_new_series": False,
-        "ranking": "",  
-        "synopsis": show_info["synopsis"],
-        "genres": show_info["genres"],
-        "imdb_rating": "",  
-        "release_year": release_year,
-        "total_seasons_count": total_seasons_count,
-        "content_advisory": content_advisory_list,
-        "audio_languages": audio_languages_list,
-        "subtitles": subtitles_list,
-        "creators_and_cast": {
-            "cast_and_crew": cast_and_crew_list, 
-            "studio": studio,
+    cast_list, producers_list = extract_cast_and_crew(shelves)
+
+    return {
+        **{
+            k: series[k]
+            for k in [
+                "series_id",
+                "series_url",
+                "title",
+                "is_new_series",
+                "ranking",
+                "synopsis",
+                "genres",
+                "imdb_rating",
+                "release_year",
+                "total_seasons_count",
+                "content_advisory",
+                "audio_languages",
+                "subtitles",
+            ]
         },
-        "trailers_and_bonus": trailers_and_bonus,
-        "seasons": seasons_output,
+        "creators_and_cast": {
+            "cast_and_crew": cast_list,
+            "producers": producers_list,
+            "studio": series["studio"],
+        },
+        "trailers_and_bonus": extract_trailers_and_bonus(shelves),
+        "seasons": seasons,
     }
-
-    return output
 
 
 def main():
-
-    monarch_1_path = r"C:\Users\parth.khatri\Desktop\github\apple-tv\monarch_1.json"
-    monarch_2_path = r"C:\Users\parth.khatri\Desktop\github\apple-tv\monarch_2.json"
-    output_path = r"C:\Users\parth.khatri\Desktop\github\apple-tv\monarch_output.json"
-
-    monarch_1 = load_json_file(monarch_1_path)
-    monarch_2 = load_json_file(monarch_2_path)
-
+    BASE = r"C:\Users\parth.khatri\Desktop\github\apple-tv"
+    monarch_1 = json.load(open(f"{BASE}\\monarch_1.json", encoding="utf-8"))
+    monarch_2 = json.load(open(f"{BASE}\\monarch_2.json", encoding="utf-8"))
     output = assemble_output(monarch_1, monarch_2)
-    write_json_file(output, output_path)
+    json.dump(
+        output,
+        open(f"{BASE}\\monarch_output.json", "w", encoding="utf-8"),
+        indent=2,
+        ensure_ascii=False,
+    )
 
 
 if __name__ == "__main__":

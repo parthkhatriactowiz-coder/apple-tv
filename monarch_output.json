@@ -80,30 +80,104 @@
   ],
   "creators_and_cast": {
     "cast_and_crew": [
-      "Kurt Russell",
-      "Wyatt Russell",
-      "Anna Sawai",
-      "Kiersey Clemons",
-      "Ren Watabe",
-      "Mari Yamamoto",
-      "Anders Holm",
-      "Joe Tippett",
-      "Takehiro Hira",
-      "Elisa Lasowski",
-      "Chris Black",
-      "Tory Tunnell",
-      "Joby Harold",
-      "Lawrence Trilling",
-      "Jen Roskind",
-      "Andrew Colville",
-      "Matt Shakman",
-      "Max Borenstein",
-      "Hiro Matsuoka",
-      "Takemasa Arita",
-      "Thomas Tull",
-      "Matt Fraction",
-      "Brad Van Arragon",
-      "Andy Goddard"
+      {
+        "name": "Kurt Russell",
+        "designation": "Lee Shaw"
+      },
+      {
+        "name": "Wyatt Russell",
+        "designation": "Young Lee Shaw"
+      },
+      {
+        "name": "Anna Sawai",
+        "designation": "Cate Randa"
+      },
+      {
+        "name": "Kiersey Clemons",
+        "designation": "May"
+      },
+      {
+        "name": "Ren Watabe",
+        "designation": "Kentaro"
+      },
+      {
+        "name": "Mari Yamamoto",
+        "designation": "Keiko"
+      },
+      {
+        "name": "Anders Holm",
+        "designation": "Young Bill Randa"
+      },
+      {
+        "name": "Joe Tippett",
+        "designation": "Tim"
+      },
+      {
+        "name": "Takehiro Hira",
+        "designation": "Hiroshi Randa"
+      },
+      {
+        "name": "Elisa Lasowski",
+        "designation": "Duvall"
+      }
+    ],
+    "producers": [
+      {
+        "name": "Chris Black",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Tory Tunnell",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Joby Harold",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Lawrence Trilling",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Jen Roskind",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Andrew Colville",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Matt Shakman",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Max Borenstein",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Hiro Matsuoka",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Takemasa Arita",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Thomas Tull",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Matt Fraction",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Brad Van Arragon",
+        "designation": "Executive Producer"
+      },
+      {
+        "name": "Andy Goddard",
+        "designation": "Executive Producer"
+      }
     ],
     "studio": "Apple TV"
   },
