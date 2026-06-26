@@ -1,8 +1,11 @@
 """
 Monarch JSON Extractor
 ======================
-Reads monarch_1.json (S1 episode details) and monarch_2.json (full page layout)
-and extracts all fields into a clean, structured output JSON.
+Reads three source JSON files and extracts all fields into a clean, structured output JSON.
+
+  monarch_1.json  -> Season 1 episode details (release dates, durations, thumbnails, ratings)
+  monarch_2.json  -> Full page layout: series info, shelves, cast, trailers, S2 partial data
+  monarch_3.json  -> Season 2 episode details (same structure as monarch_1, covers all S2 eps)
 
 Designed to work across multiple Apple TV show pages — no hardcoded show IDs,
 shelf indexes, or episode counts.
@@ -228,7 +231,6 @@ def extract_trailers_and_bonus(shelves):
     seen_urls = set()
     results = []
 
-    # ── Trailers ──
     shelf_trailers = find_shelf(shelves, "uts.col.Trailers.")
     if shelf_trailers:
         trailer_items = shelf_trailers.get("items", [])
@@ -261,7 +263,6 @@ def extract_trailers_and_bonus(shelves):
                 }
             )
 
-    # ── Bonus clips ──
     shelf_bonus = find_shelf(shelves, "uts.col.BonusContent.")
     if shelf_bonus:
         for item in shelf_bonus.get("items", []):
@@ -311,7 +312,67 @@ def build_m2_episode_lookup(shelves):
     return lookup
 
 
-def extract_season_episodes(season_number, season_start_index, monarch_1, m2_ep_lookup):
+def build_rich_episode_lookup(season_data_file):
+    """
+    Build a dict {episodeIndex: episode} from a monarch-style episode data file.
+
+    Both monarch_1 (Season 1) and monarch_3 (Season 2) share the same structure:
+      data.episodes  -> list of episode dicts with rich fields:
+                        title, description, url, duration (seconds), releaseDate (ms),
+                        rating, images.contentImage.url, episodeIndex
+
+    We key by episodeIndex so we can quickly look up any episode from monarch_2's
+    episodeIndex values.
+    """
+    lookup = {}
+    for ep in season_data_file["data"]["episodes"]:
+        ep_index = ep.get("episodeIndex")
+        if ep_index is not None:
+            lookup[ep_index] = ep
+    return lookup
+
+
+def extract_episode_from_rich_source(rich_ep, m2_ep):
+    """
+    Build one episode dict using a rich source (monarch_1 or monarch_3) as primary,
+    with monarch_2's EpisodeLockup (m2_ep) filling in any missing fields.
+
+    rich_ep:  episode dict from monarch_1 or monarch_3 (has release date, duration, rating)
+    m2_ep:    matching EpisodeLockup from monarch_2, or None if not available
+
+    This helper is used for both Season 1 and Season 2 so the logic stays in one place.
+    """
+    rating_obj = rich_ep.get("rating", {})
+    thumbnail = safe_get(rich_ep, "images", "contentImage", "url", fallback="")
+    url = rich_ep.get("url", "")
+    duration = secs_to_duration(rich_ep.get("duration"))
+
+    # monarch_2 fills in any fields the rich source is missing
+    if m2_ep:
+        if not thumbnail:
+            thumbnail = safe_get(m2_ep, "artwork", "template", fallback="")
+        if not url:
+            url = safe_get(m2_ep, "segue", "url", fallback="")
+        if not duration:
+            duration = m2_ep.get("metadata", "")
+
+    return {
+        "episode_number": rich_ep.get("episodeNumber"),
+        "episode_title": rich_ep.get("title", ""),
+        "episode_url": url,
+        "thumbnail_url": thumbnail,
+        "synopsis": rich_ep.get("description", ""),
+        "content_rating": (
+            rating_obj.get("displayName", "") if isinstance(rating_obj, dict) else ""
+        ),
+        "duration": duration,
+        "release_date": ms_to_date(rich_ep.get("releaseDate")),
+    }
+
+
+def extract_season_episodes(
+    season_number, season_start_index, monarch_1, monarch_3, m2_ep_lookup
+):
     """
     Build the episode list for one season.
 
@@ -319,81 +380,41 @@ def extract_season_episodes(season_number, season_start_index, monarch_1, m2_ep_
     season_start_index: the episodeIndex in monarch_2 where this season begins.
                         Calculated as the sum of all previous seasons' episode counts.
 
-    Season 1: monarch_1 is the primary source (has release dates, exact durations,
-              thumbnails). monarch_2 fills in any missing fields.
-    Season 2+: monarch_2 is the only source (monarch_1 only covers season 1).
+    Season 1: monarch_1 is primary (rich data: release dates, exact durations, ratings,
+              thumbnails). monarch_2 fills gaps for episodes it covers.
+    Season 2: monarch_3 is primary (same structure as monarch_1, covers all S2 eps).
+              monarch_2 fills gaps for episodes it covered before monarch_3 was available.
     """
     episodes = []
     seen_numbers = set()
 
+    # Pick the right rich source for this season
     if season_number == 1:
-        # Season 1 — use monarch_1 as primary, monarch_2 to fill gaps
-        for ep in monarch_1["data"]["episodes"]:
-            num = ep.get("episodeNumber")
-            if num in seen_numbers:
-                continue
-            seen_numbers.add(num)
-
-            rating_obj = ep.get("rating", {})
-            thumbnail = safe_get(ep, "images", "contentImage", "url", fallback="")
-            url = ep.get("url", "")
-            duration = secs_to_duration(ep.get("duration"))
-
-            # Fill gaps from monarch_2 where it has this episode (ep6-10, index 5-9)
-            m2_ep = m2_ep_lookup.get(ep.get("episodeIndex"))
-            if m2_ep:
-                if not thumbnail:
-                    thumbnail = safe_get(m2_ep, "artwork", "template", fallback="")
-                if not url:
-                    url = safe_get(m2_ep, "segue", "url", fallback="")
-                if not duration:
-                    duration = m2_ep.get("metadata", "")
-
-            episodes.append(
-                {
-                    "episode_number": num,
-                    "episode_title": ep.get("title", ""),
-                    "episode_url": url,
-                    "thumbnail_url": thumbnail,
-                    "synopsis": ep.get("description", ""),
-                    "content_rating": (
-                        rating_obj.get("displayName", "")
-                        if isinstance(rating_obj, dict)
-                        else ""
-                    ),
-                    "duration": duration,
-                    "release_date": ms_to_date(ep.get("releaseDate")),
-                }
-            )
-
+        rich_source_file = monarch_1
     else:
-        # Season 2+ — monarch_2 only
-        for ep_index in m2_ep_lookup:
-            ep = m2_ep_lookup[ep_index]
-            num = ep_index - season_start_index + 1
+        rich_source_file = monarch_3
 
-            if num in seen_numbers:
-                continue
-            seen_numbers.add(num)
+    # Build a lookup from the rich source so we can match by episodeIndex
+    rich_lookup = build_rich_episode_lookup(rich_source_file)
 
-            episodes.append(
-                {
-                    "episode_number": num,
-                    "episode_title": ep.get("title", ""),
-                    "episode_url": safe_get(ep, "segue", "url", fallback=""),
-                    "thumbnail_url": safe_get(ep, "artwork", "template", fallback=""),
-                    "synopsis": ep.get("description", ""),
-                    "content_rating": "",
-                    "duration": ep.get("metadata", ""),
-                    "release_date": "",
-                }
-            )
+    # Loop through the rich source episodes for this season
+    for ep_index, rich_ep in rich_lookup.items():
+        num = rich_ep.get("episodeNumber")
+        if num in seen_numbers:
+            continue
+        seen_numbers.add(num)
+
+        # Get the matching monarch_2 entry for this episode (may be None)
+        m2_ep = m2_ep_lookup.get(ep_index)
+
+        episode = extract_episode_from_rich_source(rich_ep, m2_ep)
+        episodes.append(episode)
 
     episodes.sort(key=lambda e: e["episode_number"])
     return episodes
 
 
-def assemble_output(monarch_1, monarch_2):
+def assemble_output(monarch_1, monarch_2, monarch_3):
     """Put all extracted pieces together into the final output dictionary."""
     page = get_page(monarch_2)
     shelves = page["shelves"]
@@ -427,6 +448,7 @@ def assemble_output(monarch_1, monarch_2):
             season_number=season_number,
             season_start_index=season_start_index,
             monarch_1=monarch_1,
+            monarch_3=monarch_3,
             m2_ep_lookup=season_lookup,
         )
 
@@ -473,7 +495,8 @@ def main():
     BASE = r"C:\Users\parth.khatri\Desktop\github\apple-tv"
     monarch_1 = json.load(open(f"{BASE}\\monarch_1.json", encoding="utf-8"))
     monarch_2 = json.load(open(f"{BASE}\\monarch_2.json", encoding="utf-8"))
-    output = assemble_output(monarch_1, monarch_2)
+    monarch_3 = json.load(open(f"{BASE}\\monarch_3.json", encoding="utf-8"))
+    output = assemble_output(monarch_1, monarch_2, monarch_3)
     json.dump(
         output,
         open(f"{BASE}\\monarch_output.json", "w", encoding="utf-8"),
